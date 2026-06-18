@@ -22,9 +22,8 @@ import time
 
 import serial
 
-from Pump import Pump
+from Pump import Pump, SYRINGE_ML
 
-SYRINGE_ML = 50.0
 DEFAULT_REFILL_VALVE = 15
 N_CHANNELS = 8
 

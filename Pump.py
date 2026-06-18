@@ -2,6 +2,11 @@ import serial
 import time
 from enum import Enum
 
+# Syringe geometry. The full 60mm stroke is 12000 steps and holds SYRINGE_ML.
+# This rig uses 25ml syringes (2x 25ml pumps).
+SYRINGE_ML = 25.0
+STROKE_STEPS = 12000
+
 
 class PumpCommand(Enum):
     """Enum for syringe pump commands"""
@@ -138,8 +143,8 @@ class Pump:
         return False
 
     def fully_retract_pump(self):
-        """Fully retract the pump (50ml)"""
-        return self.withdraw_volume(50)
+        """Fully retract the pump (full syringe)"""
+        return self.withdraw_volume(SYRINGE_ML)
 
     def set_speed(self, speed):
         """Set the pump speed (1-255)"""
@@ -157,17 +162,17 @@ class Pump:
 
     def withdraw_volume(self, volume_ml, wait_until_done=True):
         """
-        Withdraw a specific volume in ml
-        For 50ml syringe with 60mm stroke (12000 steps):
-        1ml = 12000/50 = 240 steps
+        Withdraw a specific volume in ml.
+        For a SYRINGE_ML syringe over the 60mm stroke (STROKE_STEPS steps):
+        1ml = STROKE_STEPS / SYRINGE_ML steps.
         """
         # Ensure volume is within limits
-        if volume_ml <= 0 or volume_ml > 50:
-            print(f"Invalid volume count {volume_ml}. Must be 0-50ml.")
+        if volume_ml <= 0 or volume_ml > SYRINGE_ML:
+            print(f"Invalid volume count {volume_ml}. Must be 0-{SYRINGE_ML}ml.")
             return False
 
         # Calculate steps for this volume
-        steps_per_ml = 12000 / 50  # For 50ml syringe
+        steps_per_ml = STROKE_STEPS / SYRINGE_ML
         steps = int(volume_ml * steps_per_ml)
 
         if wait_until_done:
@@ -177,17 +182,17 @@ class Pump:
 
     def inject_volume(self, volume_ml, wait_until_done=True):
         """
-        Inject a specific volume in ml
-        For 50ml syringe with 60mm stroke (12000 steps):
-        1ml = 12000/50 = 240 steps
+        Inject a specific volume in ml.
+        For a SYRINGE_ML syringe over the 60mm stroke (STROKE_STEPS steps):
+        1ml = STROKE_STEPS / SYRINGE_ML steps.
         """
         # Ensure volume is within limits
-        if volume_ml <= 0 or volume_ml > 50:
-            print(f"Invalid volume count {volume_ml}. Must be 0-50ml.")
+        if volume_ml <= 0 or volume_ml > SYRINGE_ML:
+            print(f"Invalid volume count {volume_ml}. Must be 0-{SYRINGE_ML}ml.")
             return False
 
         # Calculate steps for this volume
-        steps_per_ml = 12000 / 50  # For 50ml syringe
+        steps_per_ml = STROKE_STEPS / SYRINGE_ML
         steps = int(volume_ml * steps_per_ml)
 
         if wait_until_done:
@@ -209,8 +214,8 @@ class Pump:
             # In the SY-03 protocol, B3 is low byte, B4 is high byte
             position = (response[4] << 8) | response[3]
 
-            # Calculate equivalent volume (assuming 50ml syringe with 12000 steps)
-            volume_ml = (position / 12000) * 50
+            # Calculate equivalent volume for a SYRINGE_ML syringe
+            volume_ml = (position / STROKE_STEPS) * SYRINGE_ML
 
             print(f"Pump position: {position} steps (approx. {volume_ml:.2f}ml)")
             return volume_ml
