@@ -1,14 +1,10 @@
-import { useState } from "react";
-import { Droplet, RefreshCw } from "lucide-react";
+import { Droplet } from "lucide-react";
 import type { PumpsResponse, Role } from "./api";
-import { assignPump, discoverPumps, updatePump } from "./api";
+import { updatePump } from "./api";
 
-const ROLE_META: Record<
-  Role,
-  { label: string; sub: string; dot: string; defaultUID: number }
-> = {
-  alkaline: { label: "Alkaline pump", sub: "raises pH · LOW doses", dot: "bg-blue-500", defaultUID: 2 },
-  acid: { label: "Acid pump", sub: "lowers pH · HIGH doses", dot: "bg-orange-500", defaultUID: 1 },
+const ROLE_META: Record<Role, { label: string; sub: string; dot: string }> = {
+  alkaline: { label: "Alkaline pump", sub: "raises pH · LOW doses", dot: "bg-blue-500" },
+  acid: { label: "Acid pump", sub: "lowers pH · HIGH doses", dot: "bg-orange-500" },
 };
 
 const selectCls =
@@ -18,48 +14,16 @@ function RolePump({
   role,
   data,
   valves,
-  found,
   onChange,
 }: {
   role: Role;
   data: PumpsResponse;
   valves: number;
-  found: Record<string, string> | null;
   onChange: (d: PumpsResponse) => void;
 }) {
   const meta = ROLE_META[role];
   const cfg = data.config[role];
   const st = data.status[role];
-  const [newUID, setNewUID] = useState<number>(cfg.address ?? meta.defaultUID);
-  const [fromAddr, setFromAddr] = useState<string>("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  const foundAddrs = found ? Object.keys(found) : [];
-
-  async function assign() {
-    if (fromAddr === "") return;
-    if (
-      !window.confirm(
-        `Assign the pump currently at address ${fromAddr} as the ${role.toUpperCase()} pump ` +
-          `and write UID ${newUID} to it? Make sure this is the correct physical pump.`
-      )
-    )
-      return;
-    setBusy(true);
-    setErr(null);
-    try {
-      const r = await assignPump(role, {
-        current_address: Number(fromAddr),
-        new_address: newUID,
-      });
-      onChange(r);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : "assign failed");
-    } finally {
-      setBusy(false);
-    }
-  }
 
   async function setRefill(v: number) {
     try {
@@ -86,15 +50,21 @@ function RolePump({
         </span>
       </div>
 
-      <div className="mb-2 grid grid-cols-2 gap-x-3 gap-y-1 text-xs text-gray-500 dark:text-slate-400">
-        <div>UID (address): <b className="text-gray-700 dark:text-slate-200">{cfg.address ?? "—"}</b></div>
-        <div>port: <span className="opacity-70">{st.port ?? "—"}</span></div>
+      <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-xs text-gray-500 dark:text-slate-400">
         <div>
-          syringe: <b className="text-gray-700 dark:text-slate-200">
+          UID (fixed):{" "}
+          <b className="text-gray-700 dark:text-slate-200">{cfg.address ?? "—"}</b>
+        </div>
+        <div>
+          port: <span className="opacity-70">{st.port ?? "—"}</span>
+        </div>
+        <div>
+          syringe:{" "}
+          <b className="text-gray-700 dark:text-slate-200">
             {st.syringe_ml == null ? "—" : `${st.syringe_ml.toFixed(1)} ml`}
           </b>
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1.5">
           refill valve:
           <select
             value={cfg.refill_valve}
@@ -109,40 +79,6 @@ function RolePump({
           </select>
         </div>
       </div>
-
-      <div className="flex flex-wrap items-center gap-2 border-t border-gray-200 pt-2 text-xs dark:border-slate-700">
-        <span className="text-gray-500 dark:text-slate-400">Assign pump at</span>
-        <select
-          value={fromAddr}
-          onChange={(e) => setFromAddr(e.target.value)}
-          className={selectCls}
-          disabled={!found}
-        >
-          <option value="">{found ? "addr…" : "discover first"}</option>
-          {foundAddrs.map((a) => (
-            <option key={a} value={a}>
-              addr {a}
-            </option>
-          ))}
-        </select>
-        <span className="text-gray-500 dark:text-slate-400">→ UID</span>
-        <input
-          type="number"
-          min={0}
-          max={255}
-          value={newUID}
-          onChange={(e) => setNewUID(Number(e.target.value))}
-          className={selectCls + " w-16"}
-        />
-        <button
-          onClick={assign}
-          disabled={busy || fromAddr === ""}
-          className="rounded-lg bg-blue-600 px-3 py-1 font-medium text-white hover:bg-blue-700 disabled:bg-gray-300 dark:disabled:bg-slate-700"
-        >
-          {busy ? "…" : "Assign"}
-        </button>
-        {err && <span className="text-red-600">{err}</span>}
-      </div>
     </div>
   );
 }
@@ -156,20 +92,6 @@ export default function PumpsPanel({
   valves: number;
   onChange: (d: PumpsResponse) => void;
 }) {
-  const [found, setFound] = useState<Record<string, string> | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  async function discover() {
-    setBusy(true);
-    try {
-      setFound((await discoverPumps()).found);
-    } catch {
-      setFound({});
-    } finally {
-      setBusy(false);
-    }
-  }
-
   if (!data) return null;
 
   return (
@@ -177,26 +99,13 @@ export default function PumpsPanel({
       <div className="mb-3 flex items-center gap-2">
         <Droplet size={18} className="text-blue-600" />
         <span className="font-semibold text-gray-900 dark:text-slate-100">Pumps</span>
-        <button
-          onClick={discover}
-          disabled={busy}
-          className="ml-auto flex items-center gap-1.5 rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-700 shadow-sm transition-all hover:bg-gray-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
-        >
-          <RefreshCw size={14} className={busy ? "animate-spin" : ""} />
-          Discover
-        </button>
+        <span className="text-xs text-gray-400">
+          UID is fixed per pump · set each pump's refill valve below
+        </span>
       </div>
-      {found && (
-        <div className="mb-3 text-xs text-gray-500 dark:text-slate-400">
-          found:{" "}
-          {Object.keys(found).length === 0
-            ? "no pumps"
-            : Object.entries(found).map(([a, p]) => `addr ${a} @ ${p}`).join("  ·  ")}
-        </div>
-      )}
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <RolePump role="alkaline" data={data} valves={valves} found={found} onChange={onChange} />
-        <RolePump role="acid" data={data} valves={valves} found={found} onChange={onChange} />
+        <RolePump role="alkaline" data={data} valves={valves} onChange={onChange} />
+        <RolePump role="acid" data={data} valves={valves} onChange={onChange} />
       </div>
     </div>
   );

@@ -1,4 +1,4 @@
-import { AlertTriangle, Power, Zap } from "lucide-react";
+import { AlertTriangle, Download, Power, Zap } from "lucide-react";
 import type { ControllerStatus } from "./api";
 import { setController } from "./api";
 
@@ -105,11 +105,21 @@ export default function ControlBar({
         </div>
       )}
 
-      {events.length > 0 && (
-        <div className="mt-3">
-          <div className="mb-1 text-xs font-medium text-gray-500 dark:text-slate-400">
+      <div className="mt-3">
+        <div className="mb-1 flex items-center gap-2">
+          <div className="text-xs font-medium text-gray-500 dark:text-slate-400">
             Recent doses
           </div>
+          <a
+            href="/api/controller/log"
+            download
+            className="ml-auto flex items-center gap-1 rounded-lg border border-gray-200 bg-white px-2.5 py-1 text-xs font-medium text-gray-700 shadow-sm transition-all hover:bg-gray-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+          >
+            <Download size={12} />
+            Download log
+          </a>
+        </div>
+        {events.length > 0 ? (
           <div className="max-h-32 overflow-y-auto rounded-lg border border-gray-100 dark:border-slate-800">
             {events
               .slice()
@@ -149,8 +159,12 @@ export default function ControlBar({
                 </div>
               ))}
           </div>
-        </div>
-      )}
+        ) : (
+          <div className="px-1 text-xs text-gray-400 dark:text-slate-500">
+            No doses recorded yet.
+          </div>
+        )}
+      </div>
     </div>
   );
 }

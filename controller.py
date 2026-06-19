@@ -15,17 +15,23 @@ the syringe is depleted).
 SAFETY: starts DISARMED + DRY-RUN. Doses are serialized through one worker;
 a queued dose is cancelled if pH recovers before it runs.
 """
+import csv
 import glob
+import os
 import queue
 import threading
 import time
 
 import serial
 
-from Pump import Pump, SYRINGE_ML
+from Pump import Pump, PumpCommand, SYRINGE_ML
 
 DEFAULT_REFILL_VALVE = 15
 N_CHANNELS = 8
+# Refill to (full - margin) so a move never targets the exact stroke ceiling --
+# the firmware rejects landing on the limit (status 0x08) when the start position
+# is over-estimated by counter drift / a stale read.
+REFILL_MARGIN_ML = 1.0
 
 # which pump role handles each alarm edge
 ROLE_FOR_EDGE = {"low": "alkaline", "high": "acid"}
@@ -121,8 +127,19 @@ class PumpManager:
             pump = Pump(address=address)
             if not pump.connect(port):
                 return None
+            # Home on connect: a syringe pump reports moves as "done" but won't
+            # actually execute them (and position reads are garbage) until it has
+            # been reset to a known origin. Select the refill port FIRST so the
+            # home's draw/expel sweep cycles reagent to/from the bottle and never
+            # dispenses into the process tank (RESET preserves the valve).
+            try:
+                pump.select_valve(refill)
+                pump.send_command_and_wait(PumpCommand.RESET_PUMP, 0x0000, timeout=30)
+                pump.send_command(PumpCommand.CLEAR_POSITION, 0x0000)
+            except Exception:  # noqa: BLE001
+                pass
             rec = {"pump": pump, "port": port, "address": address,
-                   "refill_valve": refill, "connected": True, "last_remaining": None}
+                   "refill_valve": refill, "connected": True, "last_remaining": 0.0}
             self.pumps[role] = rec
             return rec
 
@@ -171,7 +188,38 @@ class PumpManager:
             v = pump.read_pump_position()
         except Exception:  # noqa: BLE001
             return None
-        return float(v) if isinstance(v, (int, float)) else None
+        # read_pump_position returns a float (ml) or None; guard against bool too
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            return None
+        return float(v)
+
+    def _rehome(self, pump):
+        """Drive to physical home and re-zero the position counter."""
+        pump.send_command_and_wait(PumpCommand.RESET_PUMP, 0x0000, timeout=30)
+        pump.send_command(PumpCommand.CLEAR_POSITION, 0x0000)
+
+    def _refill(self, pump, refill_valve, remaining):
+        """Fill toward (full - margin) from the reagent port. Robust against
+        position drift: if the relative withdraw is rejected for over-running the
+        stroke, re-home to re-zero the datum and refill from a known origin.
+        Returns the new remaining (ml) or None on failure."""
+        target = SYRINGE_ML - REFILL_MARGIN_ML
+        if not pump.select_valve(refill_valve):
+            return None
+        fill = target - remaining
+        if fill > 0 and not pump.withdraw_volume(fill):
+            # over-ran the stroke (counter drifted from physical) -> re-zero and
+            # refill from physical home. The refill valve is still selected and
+            # RESET preserves it, so the home sweep expels back to the reagent
+            # bottle, NOT the process tank.
+            print("[refill] withdraw rejected; re-homing and retrying from origin")
+            self._rehome(pump)
+            if not pump.select_valve(refill_valve):
+                return None
+            if not pump.withdraw_volume(target):
+                return None
+        v = self._remaining_ml(pump)
+        return v if v is not None else target
 
     def dose(self, role, valve, volume_ml, dry_run):
         if dry_run:
@@ -185,18 +233,29 @@ class PumpManager:
             with self._lock:
                 refilled = False
                 remaining = self._remaining_ml(pump)
+                if remaining is None:
+                    # Don't guess -- a bad read previously made us inject from an
+                    # empty syringe (firmware rejected it) and silently log "done".
+                    return "error: could not read syringe position"
                 rec["last_remaining"] = remaining
-                if remaining is not None and remaining < volume_ml:
-                    pump.select_valve(refill_valve)
-                    time.sleep(0.3)
-                    pump.withdraw_volume(max(0.0, SYRINGE_ML - remaining))  # fill to full
-                    time.sleep(0.3)
-                    rec["last_remaining"] = SYRINGE_ML
+                if remaining < volume_ml:
+                    # select_valve BLOCKS until the valve finishes rotating --
+                    # otherwise the withdraw is issued mid-rotation and silently
+                    # dropped. _refill self-corrects an over-run via re-home.
+                    new_remaining = self._refill(pump, refill_valve, remaining)
+                    if new_remaining is None:
+                        return "error: refill (withdraw) rejected by pump"
+                    rec["last_remaining"] = new_remaining
                     refilled = True
-                pump.select_valve(int(valve))
-                time.sleep(0.3)
-                pump.inject_volume(float(volume_ml))
-                if rec["last_remaining"] is not None:
+                if not pump.select_valve(int(valve)):
+                    return "error: dose valve select failed"
+                if not pump.inject_volume(float(volume_ml)):
+                    return "error: dose (inject) rejected by pump"
+                # Re-read the real position rather than trusting arithmetic.
+                after = self._remaining_ml(pump)
+                if after is not None:
+                    rec["last_remaining"] = after
+                elif rec["last_remaining"] is not None:
                     rec["last_remaining"] = max(0.0, rec["last_remaining"] - volume_ml)
             return "refilled, done" if refilled else "done"
         except Exception as e:  # noqa: BLE001
@@ -221,11 +280,12 @@ class PumpManager:
 
 # ---- trigger engine ------------------------------------------------------
 class TriggerEngine:
-    def __init__(self, hmi, get_config, manager=None, poll_s=2.0):
+    def __init__(self, hmi, get_config, manager=None, poll_s=2.0, log_path=None):
         self.hmi = hmi
         self.get_config = get_config
         self.manager = manager or PumpManager(lambda: get_config().get("pumps", {}))
         self.poll_s = poll_s
+        self.log_path = log_path   # CSV file appended on every dose (None = off)
         self.armed = False
         self.dry_run = True
         self._stop = False
@@ -348,4 +408,25 @@ class TriggerEngine:
         with self._lock:
             self.events.append(ev)
             self.events = self.events[-100:]
+        self._append_log(ev)
         print(f"[dose] CH{ch} {edge}->{role}: {vol}ml @valve{valve} -> {status}")
+
+    _LOG_HEADER = ["datetime", "channel", "edge", "role", "volume_ml", "valve", "status"]
+
+    def _append_log(self, ev):
+        """Append the dose event to the CSV log (persists across restarts)."""
+        if not self.log_path:
+            return
+        try:
+            new_file = not os.path.exists(self.log_path)
+            with open(self.log_path, "a", newline="") as f:
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow(self._LOG_HEADER)
+                w.writerow([
+                    time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ev["ts"])),
+                    ev["channel"], ev["edge"], ev["role"],
+                    ev["volume_ml"], ev["valve"], ev["status"],
+                ])
+        except Exception:  # noqa: BLE001
+            pass

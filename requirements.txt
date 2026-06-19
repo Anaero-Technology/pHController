@@ -10,6 +10,5 @@ fastapi
 uvicorn[standard]
 pydantic
 
-# pump control (used by the action layer, added later)
+# pump control (Runze SY-03B over serial)
 pyserial
-pymodbus

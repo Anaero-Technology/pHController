@@ -16,6 +16,15 @@ echo "==> apt deps"
 apt-get update
 apt-get install -y python3-venv python3-pip git
 
+echo "==> hostname  (so the Pi shows up as 'pHController' in the Fing app / router device list)"
+hostnamectl set-hostname pHController || true
+# keep /etc/hosts in sync so the name resolves locally (avoids sudo warnings)
+if grep -q '^127\.0\.1\.1' /etc/hosts; then
+  sed -i 's/^127\.0\.1\.1.*/127.0.1.1\tpHController/' /etc/hosts
+else
+  printf '127.0.1.1\tpHController\n' >> /etc/hosts
+fi
+
 echo "==> Comitup (Wi-Fi onboarding)"
 # Comitup ships from its own apt repo. See https://davesteele.github.io/comitup/
 if ! command -v comitup >/dev/null 2>&1; then
@@ -51,4 +60,6 @@ systemctl daemon-reload
 systemctl enable comitup comitup-web || true
 systemctl enable phtest-api.service
 echo "==> done. Reboot to start Comitup onboarding."
-echo "    After joining Wi-Fi, the UI is at http://pHController.local:8000  (or http://<pi-ip>:8000)"
+echo "    After joining Wi-Fi, open the UI at the Pi's IP. The IP is printed in the service log:"
+echo "        journalctl -u phtest-api -b | grep 'pH Controller UI'"
+echo "    and the Pi appears as 'pHController' in the Fing app or your router's device list."

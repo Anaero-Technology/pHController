@@ -11,12 +11,15 @@ FastAPI backend for the pH controller appliance.
 Run (dev):   .venv/bin/uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
 """
 import json
+import socket
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -25,13 +28,14 @@ from controller import TriggerEngine, discover_pumps, DEFAULT_REFILL_VALVE, ROLE
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+DOSE_LOG_PATH = Path(__file__).resolve().parent / "dose_log.csv"
 WEB_DIST = ROOT / "web" / "dist"
 
 N_CHANNELS = 8
 N_VALVES = 15          # syringe pump valve ports (1..15)
 
 client = HMIClient()
-engine = TriggerEngine(client, lambda: config)
+engine = TriggerEngine(client, lambda: config, log_path=str(DOSE_LOG_PATH))
 
 
 # ---- local config: per-channel low/high dose actions ---------------------
@@ -82,6 +86,39 @@ def save_config(cfg):
 config = load_config()
 
 
+def _primary_ip():
+    """This host's LAN IP (the interface used to reach the network). No packets
+    are actually sent -- the UDP connect just makes the OS pick the egress IP."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except Exception:  # noqa: BLE001
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def _bound_port():
+    """Port uvicorn was started with (parsed from argv); default 80."""
+    for i, a in enumerate(sys.argv):
+        if a == "--port" and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith("--port="):
+            return a.split("=", 1)[1]
+    return "80"
+
+
+def _log_access_url():
+    ip, port = _primary_ip(), _bound_port()
+    url = f"http://{ip}" if port in ("80", "http") else f"http://{ip}:{port}"
+    bar = "=" * 60
+    print(f"\n{bar}\n  pH Controller UI:  {url}\n"
+          f"  (the Pi is named 'pHController' -- find it in the Fing app\n"
+          f"   or your router's device list if you don't know the IP)\n{bar}\n",
+          flush=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
@@ -89,6 +126,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[api] HMI connect failed at startup: {e} (will keep retrying)")
     engine.start()
+    _log_access_url()
     yield
     engine.stop()
     client.stop()
@@ -188,6 +226,19 @@ def get_controller():
 @app.post("/api/controller")
 def set_controller(body: ControllerSettings):
     return engine.set(armed=body.armed, dry_run=body.dry_run)
+
+
+@app.get("/api/controller/log")
+def download_dose_log():
+    """Download the full dose history as a CSV file."""
+    if DOSE_LOG_PATH.exists():
+        return FileResponse(str(DOSE_LOG_PATH), media_type="text/csv", filename="dose_log.csv")
+    header = ",".join(TriggerEngine._LOG_HEADER) + "\n"
+    return Response(
+        content=header,
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=dose_log.csv"},
+    )
 
 
 # ---- pumps (two pumps, identified by Modbus address) ---------------------

@@ -2,10 +2,18 @@ import serial
 import time
 from enum import Enum
 
-# Syringe geometry. The full 60mm stroke is 12000 steps and holds SYRINGE_ML.
-# This rig uses 25ml syringes (2x 25ml pumps).
+# Syringe geometry. Pump model ZSB-SY03B-T16 (Runze SY-03B ceramic syringe pump),
+# firmware TAOS1-V8.26. The FULL 60mm stroke = 3000 control steps = SYRINGE_ML,
+# verified on the bench: a single WITHDRAW of 3000 steps fills the 25ml syringe
+# completely. 3000 is BOTH the per-command limit and the absolute-position
+# ceiling -- the firmware rejects any larger move (status 0x02 param-error) or
+# over-range position (status 0x08). => 120 steps/ml; no chunking ever needed
+# since the biggest possible move (25ml) is exactly 3000 steps.
+# (Generic SY-03B datasheets quote 6000/48000-step modes, but THIS firmware uses
+#  3000 -- the bench measurement governs.)
 SYRINGE_ML = 25.0
-STROKE_STEPS = 12000
+STROKE_STEPS = 3000
+MAX_STEPS = 3000
 
 
 class PumpCommand(Enum):
@@ -39,6 +47,17 @@ class PumpCommand(Enum):
 
 class Pump:
     """Class for controlling the pump"""
+
+    # Response status byte (frame byte 3), observed on TAOS1-V8.26 firmware.
+    STATUS_IDLE = 0x00       # idle / completed OK
+    STATUS_BUSY = 0x04       # motor running
+    STATUS_ACCEPTED = 0xFE   # command accepted, now executing
+    ERROR_STATUS = {
+        0x01: "frame error",
+        0x02: "parameter error (move/position too large)",
+        0x03: "optocoupler error",
+        0x08: "position out of range",
+    }
 
     def __init__(self, address=0x00):
         self.serial = None
@@ -89,15 +108,39 @@ class Pump:
             checksum_high = (checksum >> 8) & 0xFF
 
             command_frame += bytes([checksum_low, checksum_high])
+            self.serial.reset_input_buffer()   # discard stale bytes before TX
             self.serial.write(command_frame)
-            # Read response
-            time.sleep(0.5)
-            if self.serial.in_waiting:
-                response = self.serial.read(self.serial.in_waiting)
-                return response
+            return self._read_frame()
         except Exception as e:
             print(f"Error sending command: {e}")
             return False
+
+    def _read_frame(self, timeout=1.0):
+        """Read and validate ONE 8-byte response frame:
+        CC  ADDR  STATUS  D0  D1  DD  CHK_L  CHK_H
+        Returns the frame bytes, or None on timeout. Resynchronises on the
+        CC/DD framing + checksum so a stale, partial, or mis-aligned reply can
+        never be mis-parsed as a position/status value (the bug that made the
+        controller think an empty syringe was full)."""
+        deadline = time.time() + timeout
+        buf = bytearray()
+        while time.time() < deadline:
+            n = self.serial.in_waiting
+            if n:
+                buf += self.serial.read(n)
+                while len(buf) >= 8:
+                    if buf[0] != 0xCC:
+                        del buf[0]
+                        continue
+                    frame = bytes(buf[:8])
+                    if frame[5] == 0xDD:
+                        chk = sum(frame[:6]) & 0xFFFF
+                        if frame[6] == (chk & 0xFF) and frame[7] == ((chk >> 8) & 0xFF):
+                            return frame
+                    del buf[0]   # bad frame at this CC -> resync to next byte
+            else:
+                time.sleep(0.02)
+        return None
 
     def send_command_and_wait(self, command, parameter, timeout=30, poll_interval=0.5):
         """
@@ -111,25 +154,32 @@ class Pump:
         Returns:
             bool: True if command completed successfully, False if an error or timeout occurred.
         """
-        # Send the initial command
+        # Send the initial command and check it was ACCEPTED (not rejected).
+        # The firmware acks a move with 0xFE (executing); a bad parameter/position
+        # comes back immediately as an error status -- if we don't check it here we
+        # would poll, see idle, and falsely report success without any motion.
         response = self.send_command(command, parameter)
-        if not response:
+        if not response or len(response) < 3:
             print("No response to initial command.")
             return False
+        st = response[2]
+        if st in self.ERROR_STATUS:
+            print(f"{command.name} rejected: {self.ERROR_STATUS[st]} (status 0x{st:02x})")
+            return False
 
-        # Polling loop to check status
+        # Polling loop: wait for the motor to return to idle.
         start_time = time.time()
         while time.time() - start_time < timeout:
             poll_response = self.send_command(PumpCommand.QUERY_PUMP_STATUS, 0x0000)
-            if poll_response:
+            if poll_response and len(poll_response) >= 3:
                 status = poll_response[2]
-                if status == 0x00:
+                if status == self.STATUS_IDLE:
                     print(f"{command.name} completed successfully.")
                     return True
-                else:
-                    # Task still ongoing; wait and poll again
-                    print("Task ongoing...")
-                    time.sleep(poll_interval)
+                if status in self.ERROR_STATUS:
+                    print(f"{command.name} faulted: {self.ERROR_STATUS[status]}")
+                    return False
+            time.sleep(poll_interval)
 
         print(f"Timeout: {command.name} did not complete within {timeout} seconds.")
         return False
@@ -153,75 +203,70 @@ class Pump:
             return False
         return self.send_command(PumpCommand.SET_SPEED, speed)
 
-    def select_valve(self, channel):
-        """Select a valve channel (1-15)"""
+    def select_valve(self, channel, wait=True):
+        """Select a valve channel (1-15).
+
+        The valve takes ~1-2s to physically rotate (pump reports BUSY during it).
+        A move command issued while the valve is still rotating is ACK'd but
+        SILENTLY DROPPED -- so by default we block until the valve reaches idle.
+        Pass wait=False for fire-and-forget."""
         if channel < 1 or channel > 15:
             print(f"Invalid channel {channel}. Must be 1-15.")
             return False
+        if wait:
+            return self.send_command_and_wait(PumpCommand.VALVE_SELECT, channel, timeout=15)
         return self.send_command(PumpCommand.VALVE_SELECT, channel)
+
+    def _move_steps(self, command, steps, wait_until_done=True):
+        """Relative move of `steps`, split into <=MAX_STEPS chunks (the per-command
+        limit). Each chunk waits for completion when wait_until_done is set."""
+        steps = int(steps)
+        if steps <= 0:
+            return False
+        result = True
+        while steps > 0:
+            chunk = min(steps, MAX_STEPS)
+            if wait_until_done:
+                result = self.send_command_and_wait(command, chunk, timeout=300)
+                if not result:
+                    return False
+            else:
+                result = self.send_command(command, chunk)
+            steps -= chunk
+        return result
 
     def withdraw_volume(self, volume_ml, wait_until_done=True):
         """
         Withdraw a specific volume in ml.
-        For a SYRINGE_ML syringe over the 60mm stroke (STROKE_STEPS steps):
+        For a SYRINGE_ML syringe over the full stroke (STROKE_STEPS steps):
         1ml = STROKE_STEPS / SYRINGE_ML steps.
         """
-        # Ensure volume is within limits
         if volume_ml <= 0 or volume_ml > SYRINGE_ML:
             print(f"Invalid volume count {volume_ml}. Must be 0-{SYRINGE_ML}ml.")
             return False
-
-        # Calculate steps for this volume
-        steps_per_ml = STROKE_STEPS / SYRINGE_ML
-        steps = int(volume_ml * steps_per_ml)
-
-        if wait_until_done:
-            return self.send_command_and_wait(PumpCommand.WITHDRAW, steps, timeout=300)
-        else:
-            return self.send_command(PumpCommand.WITHDRAW, steps)
+        steps = int(volume_ml * (STROKE_STEPS / SYRINGE_ML))
+        return self._move_steps(PumpCommand.WITHDRAW, steps, wait_until_done)
 
     def inject_volume(self, volume_ml, wait_until_done=True):
         """
         Inject a specific volume in ml.
-        For a SYRINGE_ML syringe over the 60mm stroke (STROKE_STEPS steps):
+        For a SYRINGE_ML syringe over the full stroke (STROKE_STEPS steps):
         1ml = STROKE_STEPS / SYRINGE_ML steps.
         """
-        # Ensure volume is within limits
         if volume_ml <= 0 or volume_ml > SYRINGE_ML:
             print(f"Invalid volume count {volume_ml}. Must be 0-{SYRINGE_ML}ml.")
             return False
-
-        # Calculate steps for this volume
-        steps_per_ml = STROKE_STEPS / SYRINGE_ML
-        steps = int(volume_ml * steps_per_ml)
-
-        if wait_until_done:
-            return self.send_command_and_wait(PumpCommand.INJECT, steps, timeout=300)
-        else:
-            return self.send_command(PumpCommand.INJECT, steps)
+        steps = int(volume_ml * (STROKE_STEPS / SYRINGE_ML))
+        return self._move_steps(PumpCommand.INJECT, steps, wait_until_done)
 
     def read_pump_position(self):
-        """Read the current position of the pump in steps"""
+        """Read the current piston position and return it as ml, or None if the
+        read failed / the pump wasn't idle. (B3 low byte, B4 high byte.)"""
         response = self.send_command(PumpCommand.READ_POSITION, 0x0000)
-
-        if not response or len(response) < 8:
-            print("Failed to get valid response from pump")
-            return False
-
-        # Check response format and status
-        if response[2] == 0x00:  # Status OK
-            # Extract position value from bytes 3 and 4
-            # In the SY-03 protocol, B3 is low byte, B4 is high byte
-            position = (response[4] << 8) | response[3]
-
-            # Calculate equivalent volume for a SYRINGE_ML syringe
-            volume_ml = (position / STROKE_STEPS) * SYRINGE_ML
-
-            print(f"Pump position: {position} steps (approx. {volume_ml:.2f}ml)")
-            return volume_ml
-        else:
-            print(f"Invalid response format: {response.hex()}")
-            return False
+        if not response or len(response) < 8 or response[2] != self.STATUS_IDLE:
+            return None
+        position = (response[4] << 8) | response[3]
+        return (position / STROKE_STEPS) * SYRINGE_ML
 
     def query_address(self):
         """Return the pump's stored Modbus address (its UID), or None."""

@@ -16,8 +16,8 @@ Turns the Pi into a headless appliance that:
 ```
             Wi-Fi (internet, via Comitup)          Ethernet / local net
  phone/laptop ───────────────► Raspberry Pi ───────────────► HMI (RK600-07C)
-   browser                     ├─ FastAPI (api/app.py)  :8000   192.168.2.112
-   http://pHController.local:8000   ├─ serves web/dist (React UI)
+   browser                     ├─ FastAPI (api/app.py)  :80     192.168.2.112
+   http://pHController.local        ├─ serves web/dist (React UI)
                                 ├─ hmi.py  (socket.io v2 client) ── reads pH,
                                 │                                   writes min/max
                                 └─ config.json (per-channel action)
@@ -47,14 +47,41 @@ sudo reboot
 ```
 
 After reboot: join the **pHController-xxxx** hotspot, pick your Wi-Fi in the
-portal. Once connected, open **http://pHController.local:8000** (or
-`http://<pi-ip>:8000`).
+portal. Once connected, open the UI at the Pi's address — see
+**[Finding the Pi](#finding-the-pi--giving-it-a-fixed-address)** below.
 
 `install.sh` installs Comitup, creates the venv, installs `requirements.txt`,
 builds the UI (needs Node; otherwise build `web/dist` on a dev machine and copy
 it over), and installs `/etc/comitup.conf` + the `phtest-api.service` unit.
 Comitup's `web_service:` setting starts the app when online and stops it in
 config mode.
+
+## Finding the Pi / giving it a fixed address
+
+Comitup gets the Pi onto your Wi-Fi, but the router then assigns it an IP that
+can change. mDNS (`pHController.local`) works on Apple/Windows but is flaky on
+some networks and Android, so the reliable options are:
+
+**Find the current IP (simple, no command line):**
+- From a phone, install **Fing** (free, iOS/Android), scan the Wi-Fi, and tap the
+  device named **`pHController`** — it shows the IP (and can open it).
+- Or open your **router's admin page → connected devices** and find `pHController`.
+- On the Pi itself, the service prints it every boot:
+  `journalctl -u phtest-api -b | grep "pH Controller UI"`.
+
+**Make the IP fixed (recommended — set once, bookmark forever):**
+A *DHCP reservation* tells the router to always hand the Pi the same IP, with no
+config change on the Pi:
+1. Find the Pi's IP **and MAC** (any method above; the MAC looks like `b8:27:eb:…`).
+2. Log into the router (often `http://192.168.1.1`).
+3. Open **DHCP / LAN → "Address Reservation"** (the name varies by router).
+4. Select `pHController` (or paste its MAC) and pin it to a free IP, e.g.
+   `192.168.1.50`.
+5. Reboot the Pi — from then on it's always at `http://192.168.1.50`. Bookmark it.
+
+> Alternative: a **static IP** set on the Pi itself (no router access needed) —
+> only suitable if the appliance always lives on the same network. Ask and it can
+> be wired into `install.sh`.
 
 ## Develop (on a laptop)
 
