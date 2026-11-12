@@ -1,0 +1,3 @@
+#!/bin/sh
+# Fake nmcli for development -- see tests/fake_nmcli.py.
+exec python3 "$(dirname "$0")/../fake_nmcli.py" "$@"

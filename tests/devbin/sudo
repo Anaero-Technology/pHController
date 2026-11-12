@@ -1,0 +1,5 @@
+#!/bin/sh
+# Fake sudo for development: drops -n and runs the command unprivileged.
+# Only ever used when tests/devbin is put on PATH on purpose.
+[ "$1" = "-n" ] && shift
+exec "$@"

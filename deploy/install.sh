@@ -1,65 +1,69 @@
 #!/usr/bin/env bash
 #
-# One-time setup on a Raspberry Pi (Raspberry Pi OS / Debian Bookworm).
-# Run from the project root:  sudo bash deploy/install.sh
+# Install / update the pH controller on a Raspberry Pi (Raspberry Pi OS
+# Bookworm or later). Safe to re-run after a `git pull`.
 #
-# It: installs system deps + Comitup, creates the Python venv, builds the web
-# UI (if Node is present, else expects a prebuilt web/dist), and installs the
-# systemd service + Comitup config.
+#     sudo bash deploy/install.sh
+#
+# It installs system packages, creates the Python venv, builds the web UI (if
+# Node is present, else expects a prebuilt web/dist), configures networking
+# (see setup_network.sh -- its environment options work here too, e.g.
+# `sudo ETH_STATIC_ADDRESS=192.168.2.50/24 bash deploy/install.sh`), and
+# installs + starts the phcontroller systemd service.
 set -euo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "error: run with sudo (sudo bash deploy/install.sh)" >&2
+  exit 1
+fi
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVICE_USER="${SUDO_USER:-pi}"
+if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+  echo "error: user '$SERVICE_USER' does not exist. Run via sudo from the account" >&2
+  echo "       that should own the service." >&2
+  exit 1
+fi
 echo "==> project: $PROJECT_DIR   user: $SERVICE_USER"
 
-echo "==> apt deps"
+echo "==> apt packages"
 apt-get update
-apt-get install -y python3-venv python3-pip git
+apt-get install -y python3-venv python3-pip git avahi-daemon
 
-echo "==> hostname  (so the Pi shows up as 'pHController' in the Fing app / router device list)"
-hostnamectl set-hostname pHController || true
-# keep /etc/hosts in sync so the name resolves locally (avoids sudo warnings)
-if grep -q '^127\.0\.1\.1' /etc/hosts; then
-  sed -i 's/^127\.0\.1\.1.*/127.0.1.1\tpHController/' /etc/hosts
-else
-  printf '127.0.1.1\tpHController\n' >> /etc/hosts
-fi
-
-echo "==> Comitup (Wi-Fi onboarding)"
-# Comitup ships from its own apt repo. See https://davesteele.github.io/comitup/
-if ! command -v comitup >/dev/null 2>&1; then
-  curl -sL https://davesteele.github.io/comitup/deb/davesteele-comitup-apt-source_latest.deb \
-       -o /tmp/comitup-apt-source.deb
-  dpkg -i /tmp/comitup-apt-source.deb || true
-  apt-get update
-  apt-get install -y comitup
-  # Comitup needs NetworkManager and conflicts with dhcpcd/wpa_supplicant mgmt.
-  echo "    (review Comitup docs: it disables dhcpcd and uses NetworkManager)"
-fi
-
-echo "==> python venv + deps"
+echo "==> python venv + dependencies"
 sudo -u "$SERVICE_USER" python3 -m venv "$PROJECT_DIR/.venv"
 sudo -u "$SERVICE_USER" "$PROJECT_DIR/.venv/bin/pip" install --upgrade pip
 sudo -u "$SERVICE_USER" "$PROJECT_DIR/.venv/bin/pip" install -r "$PROJECT_DIR/requirements.txt"
 
-echo "==> build web UI"
+echo "==> web UI"
 if command -v npm >/dev/null 2>&1; then
-  sudo -u "$SERVICE_USER" bash -c "cd '$PROJECT_DIR/web' && npm install && npm run build"
+  sudo -u "$SERVICE_USER" bash -c "cd '$PROJECT_DIR/web' && npm ci && npm run build"
+elif [ -f "$PROJECT_DIR/web/dist/index.html" ]; then
+  echo "    npm not found; using the prebuilt web/dist"
 else
-  echo "    npm not found; expecting a prebuilt $PROJECT_DIR/web/dist (build it on a dev machine)."
+  echo "    warning: npm not found and web/dist is missing. Build it on another" >&2
+  echo "             machine (cd web && npm ci && npm run build) and copy web/dist over." >&2
 fi
 
-echo "==> install configs"
-chmod +x "$PROJECT_DIR/deploy/wait-online.sh"
-install -m 644 "$PROJECT_DIR/deploy/comitup.conf" /etc/comitup.conf
-# render the service file for the actual user/path
-sed -e "s#/home/pi/pHTest#$PROJECT_DIR#g" -e "s#User=pi#User=$SERVICE_USER#g" \
-    "$PROJECT_DIR/deploy/phtest-api.service" > /etc/systemd/system/phtest-api.service
+echo "==> serial access for the pumps"
+usermod -aG dialout "$SERVICE_USER"
 
+bash "$PROJECT_DIR/deploy/setup_network.sh" "$SERVICE_USER"
+
+echo "==> systemd service"
+# The service used to be called phtest-api and was started/stopped by Comitup.
+if [ -f /etc/systemd/system/phtest-api.service ]; then
+  systemctl disable --now phtest-api.service 2>/dev/null || true
+  rm -f /etc/systemd/system/phtest-api.service
+fi
+sed -e "s#__PROJECT_DIR__#$PROJECT_DIR#g" -e "s#__SERVICE_USER__#$SERVICE_USER#g" \
+    "$PROJECT_DIR/deploy/phcontroller.service" > /etc/systemd/system/phcontroller.service
 systemctl daemon-reload
-systemctl enable comitup comitup-web || true
-systemctl enable phtest-api.service
-echo "==> done. Reboot to start Comitup onboarding."
-echo "    After joining Wi-Fi, open the UI at the Pi's IP. The IP is printed in the service log:"
-echo "        journalctl -u phtest-api -b | grep 'pH Controller UI'"
-echo "    and the Pi appears as 'pHController' in the Fing app or your router's device list."
+systemctl enable phcontroller.service
+systemctl restart phcontroller.service
+
+echo
+echo "==> done. The controller is running."
+echo "    Plug an Ethernet cable from a laptop into the Pi and open  http://169.254.50.1"
+echo "    Wi-Fi and fixed addresses are set from the UI's Network page."
+echo "    Logs: journalctl -u phcontroller -f"

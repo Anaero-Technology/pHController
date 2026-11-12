@@ -65,13 +65,34 @@ export interface ChannelUpdate {
   high?: Action;
 }
 
-async function json<T>(res: Response): Promise<T> {
-  if (!res.ok) {
-    const text = await res.text().catch(() => res.statusText);
-    throw new Error(text || `HTTP ${res.status}`);
+// FastAPI reports errors as {"detail": "..."} (or a list of validation issues);
+// surface the message itself rather than the raw JSON body.
+async function errorMessage(res: Response): Promise<string> {
+  const text = await res.text().catch(() => "");
+  try {
+    const detail = JSON.parse(text)?.detail;
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) {
+      return detail.map((d) => d?.msg ?? String(d)).join("; ");
+    }
+  } catch {
+    /* not JSON */
   }
+  return text || res.statusText || `HTTP ${res.status}`;
+}
+
+// The server answered with an error -- as opposed to fetch() rejecting because
+// the request never completed (which, after a network change, usually means the
+// link we were talking over was just reconfigured).
+export class ApiError extends Error {}
+
+async function json<T>(res: Response): Promise<T> {
+  if (!res.ok) throw new ApiError(await errorMessage(res));
   return res.json() as Promise<T>;
 }
+
+export const getHealth = () =>
+  fetch("/api/health").then((r) => json<{ connected: boolean; channels: number }>(r));
 
 export const getMeta = () => fetch("/api/meta").then((r) => json<Meta>(r));
 
@@ -124,3 +145,68 @@ export const assignPump = (
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   }).then((r) => json<PumpsResponse & { assign: unknown }>(r));
+
+// ---- network (the appliance's own Ethernet / Wi-Fi settings) ----
+export type IfaceType = "ethernet" | "wifi";
+
+export interface NetInterface {
+  device: string;
+  type: IfaceType;
+  state: string; // NetworkManager state, e.g. "connected", "unavailable"
+  connection: string | null;
+  ssid: string | null;
+  method: string | null; // "auto" (DHCP) | "manual" (static) | ...
+  addresses: string[]; // CIDR, e.g. "192.168.1.20/24"
+  gateway: string | null;
+  dns: string[];
+  mac: string | null;
+}
+
+export interface NetworkStatus {
+  supported: boolean; // false on a dev machine without NetworkManager
+  hostname: string | null; // mDNS name, e.g. "phcontroller.local"
+  rescue_address: string; // always-on direct-cable address (CIDR)
+  interfaces: NetInterface[];
+  hmi: { host: string; connected: boolean; on_subnet: boolean | null };
+}
+
+export interface WifiNetwork {
+  ssid: string;
+  signal: number; // percent, -1 if unknown
+  security: string;
+  open: boolean;
+  enterprise: boolean;
+  connected: boolean;
+}
+
+export type IpConfig =
+  | { mode: "dhcp" }
+  | { mode: "static"; address: string; prefix: number; gateway: string; dns: string[] };
+
+export const getNetwork = () => fetch("/api/network").then((r) => json<NetworkStatus>(r));
+
+export const setIpConfig = (type: IfaceType, body: IpConfig) =>
+  fetch(`/api/network/${type}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then((r) => json<{ message: string }>(r));
+
+export const scanWifi = () =>
+  fetch("/api/network/wifi/networks").then((r) =>
+    json<{ networks: WifiNetwork[]; error: string | null }>(r)
+  );
+
+export const connectWifi = (body: {
+  ssid: string;
+  password: string;
+  username?: string;
+  security: string;
+  eap_method?: string;
+  phase2?: string;
+}) =>
+  fetch("/api/network/wifi/connect", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  }).then((r) => json<{ message: string }>(r));

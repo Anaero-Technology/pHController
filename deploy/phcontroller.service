@@ -1,0 +1,22 @@
+[Unit]
+Description=pH Controller API + Web UI
+# Starts as soon as the network stack exists -- NOT when there is internet.
+# The UI must answer on a direct Ethernet cable with nothing else connected.
+After=network.target NetworkManager.service
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+WorkingDirectory=__PROJECT_DIR__
+# Bind port 80 without running as root, so the UI is at http://phcontroller.local
+# (or http://169.254.50.1) with no :port suffix.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Environment=PYTHONUNBUFFERED=1
+# Optional overrides, e.g. PHTEST_HMI_HOST=http://192.168.2.112
+EnvironmentFile=-/etc/default/phcontroller
+ExecStart=__PROJECT_DIR__/.venv/bin/uvicorn api.app:app --host 0.0.0.0 --port 80
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

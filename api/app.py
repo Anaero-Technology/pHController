@@ -6,13 +6,16 @@ FastAPI backend for the pH controller appliance.
 - Stores, per pH channel, a LOW-trip dose and a HIGH-trip dose. Each dose is
   "pump <volume_ml> from valve port <valve>" (the syringe pump's 15-port valve).
   These are stored in config.json; the pump trigger layer consumes them later.
+- Exposes the appliance's own network settings (api/network.py): Ethernet with
+  a fixed direct-cable address, optional Wi-Fi joined from the UI.
 - Serves the built React UI (web/dist) as static files.
 
 Run (dev):   .venv/bin/uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
 """
 import json
-import socket
+import os
 import sys
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -23,8 +26,10 @@ from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import netconfig
+from api.network import build_router as build_network_router
 from hmi import HMIClient
-from controller import TriggerEngine, discover_pumps, DEFAULT_REFILL_VALVE, ROLES
+from controller import TriggerEngine, DEFAULT_REFILL_VALVE, ROLES
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
@@ -79,24 +84,24 @@ def load_config():
     return base
 
 
+_save_lock = threading.Lock()
+
+
 def save_config(cfg):
-    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    # Write-then-rename: the appliance gets unplugged without warning, and a
+    # half-written config.json would silently reset every pump assignment and
+    # dose setting to defaults on the next boot. The lock keeps two requests
+    # from interleaving in the temp file.
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    with _save_lock:
+        with open(tmp, "w") as f:
+            f.write(json.dumps(cfg, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
 
 
 config = load_config()
-
-
-def _primary_ip():
-    """This host's LAN IP (the interface used to reach the network). No packets
-    are actually sent -- the UDP connect just makes the OS pick the egress IP."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    except Exception:  # noqa: BLE001
-        return "127.0.0.1"
-    finally:
-        s.close()
 
 
 def _bound_port():
@@ -109,14 +114,21 @@ def _bound_port():
     return "80"
 
 
-def _log_access_url():
-    ip, port = _primary_ip(), _bound_port()
-    url = f"http://{ip}" if port in ("80", "http") else f"http://{ip}:{port}"
+def _log_access_urls():
+    """Print every address the UI answers on (see `journalctl -u phcontroller`).
+    Addresses that appear later (Wi-Fi joined from the UI, DHCP lease) are
+    listed live on the UI's Network page."""
+    port = _bound_port()
+    suffix = "" if port in ("80", "http") else f":{port}"
+    rescue = netconfig.RESCUE_ADDRESS.split("/")[0]
+    hosts = [h for h in netconfig.local_addresses() if h != rescue]
+    name = netconfig.mdns_hostname()
+    if name:
+        hosts.insert(0, name)
+    lines = [f"    http://{h}{suffix}" for h in hosts]
+    lines.append(f"    http://{rescue}{suffix}   (direct Ethernet cable, always available)")
     bar = "=" * 60
-    print(f"\n{bar}\n  pH Controller UI:  {url}\n"
-          f"  (the Pi is named 'pHController' -- find it in the Fing app\n"
-          f"   or your router's device list if you don't know the IP)\n{bar}\n",
-          flush=True)
+    print(f"\n{bar}\n  pH Controller UI:\n" + "\n".join(lines) + f"\n{bar}\n", flush=True)
 
 
 @asynccontextmanager
@@ -126,7 +138,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"[api] HMI connect failed at startup: {e} (will keep retrying)")
     engine.start()
-    _log_access_url()
+    _log_access_urls()
     yield
     engine.stop()
     client.stop()
@@ -306,6 +318,9 @@ def update_channel(ch: int, body: ChannelUpdate):
         client.set_threshold(ch, lo=body.min, hi=body.max)
 
     return channel_row(ch)
+
+
+app.include_router(build_network_router(client))
 
 
 # ---- static UI (built React app) -- mounted last so /api wins ------------

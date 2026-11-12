@@ -3,7 +3,12 @@
 # IMPORTANT: socketio is pinned to 4.x because the HMI is a Socket.IO v2
 # (EIO3) server. python-socketio 5.x can READ over websocket but its WRITES
 # (SetById) are silently ignored. Do not bump these without re-testing writes.
-python-socketio==4.6.1
+#
+# The [client] extra pulls in `requests` and `websocket-client`. They are not
+# optional here: without `requests`, engineio logs one line and returns from
+# connect() as if it had succeeded, so the app reports the HMI as connected
+# while no data ever arrives.
+python-socketio[client]==4.6.1
 python-engineio==3.14.2
 
 fastapi
