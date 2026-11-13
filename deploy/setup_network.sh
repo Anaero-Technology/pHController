@@ -17,7 +17,8 @@
 #   * Removes Comitup (the old Wi-Fi setup hotspot) if it is installed.
 #
 # Optional environment:
-#   PH_HOSTNAME=phcontroller            mDNS / DHCP hostname
+#   PH_HOSTNAME=phcontroller-lab2       mDNS / DHCP hostname (default
+#                                       phcontroller; kept on later runs)
 #   ETH_STATIC_ADDRESS=192.168.2.50/24  give Ethernet this fixed address instead
 #                                       of DHCP (e.g. on the HMI's subnet). Can
 #                                       also be done later from the web UI.
@@ -28,7 +29,17 @@ set -euo pipefail
 # Keep in sync with RESCUE_ADDRESS in netconfig.py.
 RESCUE_CIDR="169.254.50.1/16"
 
-NEW_HOSTNAME="${PH_HOSTNAME:-phcontroller}"
+# Hostname: an explicit PH_HOSTNAME wins. Otherwise keep a name this script
+# set on an earlier run (so updating a unit installed as phcontroller-lab2
+# doesn't rename it), and default to phcontroller.
+CURRENT_HOSTNAME="$(hostname | tr '[:upper:]' '[:lower:]')"
+if [ -n "${PH_HOSTNAME:-}" ]; then
+  NEW_HOSTNAME="$PH_HOSTNAME"
+elif [[ "$CURRENT_HOSTNAME" == phcontroller* ]]; then
+  NEW_HOSTNAME="$CURRENT_HOSTNAME"
+else
+  NEW_HOSTNAME="phcontroller"
+fi
 SERVICE_USER="${1:-${SUDO_USER:-pi}}"
 ETH_STATIC_ADDRESS="${ETH_STATIC_ADDRESS:-}"
 

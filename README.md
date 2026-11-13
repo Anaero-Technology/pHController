@@ -54,28 +54,23 @@ A different HMI address: put `PHTEST_HMI_HOST=http://<address>` in
 
 ## Install (on the Pi)
 
-Raspberry Pi OS Bookworm or later (it must be running NetworkManager, the
-default). Node.js is needed to build the UI on the Pi; otherwise build
-`web/dist` elsewhere and copy it over.
+**[INSTALL.md](INSTALL.md) is the step-by-step guide**: flashing the SD card,
+installing, first connection, HMI and pump setup, updating, troubleshooting.
+
+In short, on Raspberry Pi OS Bookworm or later, with internet:
 
 ```bash
 git clone https://github.com/Anaero-Technology/pHController.git && cd pHController
 sudo bash deploy/install.sh
 ```
 
-Re-run the same command after a `git pull` to update. Options (environment
-variables, all optional):
+Re-run the same command after a `git pull` to update; it also migrates units
+that used the old Comitup setup hotspot.
 
-| Variable | Effect |
-|----------|--------|
-| `ETH_STATIC_ADDRESS=192.168.2.50/24` | Give Ethernet this fixed address instead of DHCP |
-| `WIFI_COUNTRY=GB` | Set the Wi-Fi regulatory country (Raspberry Pi OS keeps Wi-Fi blocked until one is set) |
-| `PH_HOSTNAME=phcontroller` | Hostname / mDNS name |
-
-The installer creates the Python venv, builds the UI, runs
-`deploy/setup_network.sh` and installs the `phcontroller` systemd service
-(`journalctl -u phcontroller -f` for logs; every start prints the addresses the
-UI answers on).
+The installer creates the Python venv, installs Node.js if needed and builds
+the UI, runs `deploy/setup_network.sh` and installs the `phcontroller` systemd
+service (`journalctl -u phcontroller -f` for logs; every start prints the
+addresses the UI answers on).
 
 `setup_network.sh` is the whole network strategy in one place: it sets the
 hostname and Avahi (mDNS), puts `169.254.50.1/16` on the Ethernet profile next
@@ -83,15 +78,6 @@ to DHCP, and allows the service user to run `nmcli` as root (a sudoers rule
 scoped to that one binary) so the UI can apply changes. An Ethernet profile
 that already has a static address is left as it is, apart from gaining the
 rescue address.
-
-### Updating a unit that used the Wi-Fi setup hotspot (Comitup)
-
-Earlier versions onboarded through a Comitup hotspot and only started the UI
-once the Pi had internet. `install.sh` migrates such a unit: it removes Comitup
-and its hotspot profile, replaces the old `phtest-api` service with
-`phcontroller`, and leaves saved Wi-Fi networks alone. Run it
-over Ethernet or with a keyboard attached, not through the setup hotspot (that
-connection goes away during the update).
 
 ## How dosing works
 

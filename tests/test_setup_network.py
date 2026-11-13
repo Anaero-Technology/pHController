@@ -29,6 +29,7 @@ STUBS = {
     "rfkill": "exit 0",
     "sed": "exit 0",                      # only ever used with -i on /etc files
     "raspi-config": 'echo GB',
+    "hostname": 'echo "${STUB_HOSTNAME:-raspberrypi}"',
     "id": '[ "$1" = "-u" ] && echo 0; exit 0',
     "dpkg": 'exit "${STUB_COMITUP_INSTALLED:-1}"',
     # keep the sudoers rule where the test can read it
@@ -149,3 +150,19 @@ def test_comitup_hotspot_is_removed_but_joined_wifi_is_kept(setup):
     assert "removing Comitup" in result.stdout
     assert "hotspot-uuid" not in state["connections"]
     assert "client-uuid" in state["connections"]
+
+
+@pytest.mark.parametrize("current, requested, expected", [
+    ("raspberrypi", None, "phcontroller"),                 # fresh OS image
+    ("pHController", None, "phcontroller"),                # unit from the Comitup era
+    ("phcontroller-lab2", None, "phcontroller-lab2"),      # an update must not rename it
+    ("phcontroller-lab2", "phcontroller-lab3", "phcontroller-lab3"),
+])
+def test_hostname_choice(setup, current, requested, expected):
+    env = {"STUB_HOSTNAME": current}
+    if requested:
+        env["PH_HOSTNAME"] = requested
+    result, _ = setup(**env)
+    assert result.returncode == 0, result.stderr
+    assert f"==> hostname: {expected}\n" in result.stdout
+    assert f"http://{expected}.local" in result.stdout
